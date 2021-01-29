@@ -1,0 +1,1237 @@
+// TODO: change Vertex and Color structs to glm::vec types
+// TODO: design mario gfx
+// TODO: design and implement coin tile
+// TODO: mushroom physics
+// TODO: remove AABB class
+// TODO: refactor gravity to PhysicsComponent and make it configurable
+// TODO: use indexed colors
+
+// TODO: cleanup code style of all files
+// TODO: integrate platformed into game states
+
+#include <glm/vec2.hpp>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_opengl.h>
+
+#include <cstdlib>
+#include <cstdio>
+#include <cmath>
+
+#include <chrono>
+#include <thread>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <algorithm>
+#include <map>
+#include <vector>
+#include <string>
+
+#include "json.hpp"
+using json = nlohmann::json;
+
+
+// ===========================================================================
+// C O N S T A N T S =========================================================
+
+const int TILE_SIZE = 48;
+
+const int SCREEN_WIDTH = 1280;
+const int SCREEN_HEIGHT = 720;
+
+const int LEVEL_WIDTH = 64 * TILE_SIZE;
+const int LEVEL_HEIGHT = SCREEN_HEIGHT + TILE_SIZE;
+
+
+// ===========================================================================
+// G L O B A L S =============================================================
+
+SDL_Window* window = NULL;
+SDL_GLContext context;
+bool quit = false;
+
+
+// ===========================================================================
+// E N U M S =================================================================
+
+enum class BlockType
+{
+	EMPTY = 0,
+	STONE = 1,
+	BLOCK = 2,
+	BRICK = 3,
+	SPECIAL = 4,
+	INVISIBLE = 5
+};
+
+enum class BlockState
+{
+	NORMAL = 0,
+	DISABLED = 1
+};
+
+
+// ===========================================================================
+// S T R U C T S =============================================================
+
+struct Camera
+{
+	float x;
+	float y;
+	float w;
+	float h;
+};
+
+struct Vertex
+{
+	GLfloat x;
+	GLfloat y;
+};
+
+struct Color
+{
+	GLfloat r;
+	GLfloat g;
+	GLfloat b;
+};
+
+std::vector<Color> color_buffer;
+std::vector<Vertex> vertex_buffer;
+
+struct Mesh
+{
+	std::vector<Color> colors;
+	std::vector<Vertex> vertices;
+	inline void render(float x, float y, float scale = 1.0f)
+	{
+		for (unsigned int i = 0; i < vertices.size(); i++)
+		{
+			Vertex v = vertices[i];
+			v.x *= scale;
+			v.y *= scale;
+			v.x += x;
+			v.y += y;
+			vertex_buffer.push_back(v);
+		}
+		color_buffer.insert(color_buffer.end(), colors.begin(), colors.end());
+	}
+};
+
+// globals
+Camera camera;
+std::map<std::string, Mesh> data;
+
+
+// ===========================================================================
+// F R A M E =================================================================
+
+class Frame
+{
+public:
+
+	std::string mesh;
+	unsigned int duration;
+
+	Frame(std::string m, unsigned int d = 0)
+	{
+		mesh = m;
+		duration = d;
+	}
+};
+
+
+// ===========================================================================
+// A N I M A T I O N =========================================================
+
+class Anim
+{
+public:
+
+	bool loop;
+	unsigned int timer;
+	unsigned int frame;
+	std::vector<Frame> frames;
+
+	Anim()
+	{
+		frame = 0;
+		timer = 0;
+		loop = false;
+	}
+
+	void update()
+	{
+		if (timer == frames[frame].duration)
+		{
+			frame += 1;
+			if (frame == frames.size())
+			{
+				frame = 0;
+			}
+			timer = 0;
+			return;
+		}
+		timer += 1;
+	}
+
+	void render(float x, float y)
+	{
+		if (frames[frame].duration > 0)
+		{
+			update();
+		}
+		data[frames[frame].mesh].render(x, y, 0.2f);
+	}
+};
+
+
+// ===========================================================================
+// C O I N ===================================================================
+
+class Coin
+{
+public:
+
+	static unsigned int index;
+	static std::vector<Coin> instances;
+
+	Anim anim;
+
+	float x;
+	float y;
+	int frame;
+	float speed;
+	bool active;
+
+	Coin(float xx, float yy)
+	{
+		x = xx;
+		y = yy;
+		frame = 0;
+		speed = 18.0f;
+		active = false;
+		anim.frames.push_back(Frame("coin-bump-1", 2));
+		anim.frames.push_back(Frame("coin-bump-2", 4));
+		anim.frames.push_back(Frame("coin-bump-3", 2));
+		anim.frames.push_back(Frame("coin-bump-4", 2));
+	}
+
+	static void Init()
+	{
+		for (unsigned int i = 0; i < 16; i++)
+		{
+			Coin::instances.push_back(Coin(0, 0));
+		}
+	}
+
+	static void Add(float xx, float yy)
+	{
+		Coin::instances[index].activate(xx, yy);
+		index++;
+		if (index == 16) {
+			index = 0;
+		}
+	}
+
+	static void RenderAll()
+	{
+		for (unsigned i = 0; i < Coin::instances.size(); i++)
+		{
+			Coin::instances[i].render();
+		}
+	}
+
+	void activate(float xx, float yy)
+	{
+		x = xx;
+		y = yy;
+		frame = 0;
+		speed = 18.0f;
+		active = true;
+	}
+
+	inline void render()
+	{
+		if (not active)
+		{
+			return;
+		}
+		frame++;
+		y -= speed;
+		speed -= 0.9f;
+		if (frame == 34)
+		{
+			active = false;
+		}
+		anim.render(x - camera.x, y - camera.y);
+	}
+};
+
+unsigned int Coin::index = 0;
+std::vector<Coin> Coin::instances;
+
+
+// ===========================================================================
+// B L O C K =================================================================
+
+class Block
+{
+public:
+
+	BlockType type;
+	BlockState state;
+	std::map<BlockState, Anim> anim;
+
+	// properties
+	bool can_bump;
+	bool is_obstacle;
+
+	// new
+	bool bumping;
+	int bump_timer;
+	int bump_direction;
+
+	Block()
+	{
+		bump_timer = 0;
+		bumping = false;
+		can_bump = false;
+		is_obstacle = false;
+		bump_direction = 0;
+		type = BlockType::EMPTY;
+		state = BlockState::NORMAL;
+	}
+
+	Block(BlockType t)
+	{
+		type = t;
+		bump_timer = 0;
+		bumping = false;
+		can_bump = false;
+		is_obstacle = false;
+		bump_direction = 0;
+		state = BlockState::NORMAL;
+
+		if (type == BlockType::EMPTY)
+		{
+			can_bump = false;
+			is_obstacle = false;
+		}
+		else if (type == BlockType::STONE)
+		{
+			can_bump = false;
+			is_obstacle = true;
+			anim[BlockState::NORMAL]
+				 .frames.push_back(Frame("tile-1", 0));
+		}
+		else if (type == BlockType::BLOCK)
+		{
+			can_bump = false;
+			is_obstacle = true;
+			anim[BlockState::NORMAL]
+				 .frames.push_back(Frame("tile-2", 0));
+		}
+		else if (type == BlockType::BRICK)
+		{
+			can_bump = true;
+			is_obstacle = true;
+			anim[BlockState::NORMAL]
+				 .frames.push_back(Frame("tile-3", 0));
+		}
+		else if (type == BlockType::SPECIAL)
+		{
+			can_bump = true;
+			is_obstacle = true;
+			anim[BlockState::NORMAL]
+				 .frames.push_back(Frame("tile-4", 30));
+			anim[BlockState::NORMAL]
+				 .frames.push_back(Frame("tile-5", 5));
+			anim[BlockState::NORMAL]
+				 .frames.push_back(Frame("tile-6", 5));
+			anim[BlockState::NORMAL]
+				 .frames.push_back(Frame("tile-5", 5));
+
+			anim[BlockState::DISABLED]
+				 .frames.push_back(Frame("tile-2", 0));
+		}
+		else if (type == BlockType::INVISIBLE)
+		{
+			can_bump = false;
+			is_obstacle = true;
+		}
+	}
+
+	void bump()
+	{
+		if (not can_bump)
+		{
+			return;
+		}
+		if (type == BlockType::SPECIAL)
+		{
+			if (state == BlockState::NORMAL)
+			{
+				bumping = true;
+				state = BlockState::DISABLED;
+			}
+		}
+		else {
+			bumping = true;
+		}
+	}
+
+	void render(float x, float y)
+	{
+		if (type == BlockType::EMPTY)
+		{
+			return;
+		}
+		if (bumping)
+		{
+			// drop coin
+			if (bump_timer == 0)
+			{
+				Coin::Add(x + camera.x, y + camera.y);
+			}
+			// up
+			if (bump_direction == 0)
+			{
+				bump_timer += 2;
+				if (bump_timer == 8)
+				{
+					bump_direction = 1;
+				}
+			}
+			// down
+			else
+			{
+				bump_timer -= 2;
+				if (bump_timer == 0)
+				{
+					bump_direction = 0;
+					bump_timer = 0;
+					bumping = false;
+				}
+			}
+		}
+		anim[state].render(x, y + (float)-bump_timer * 2);
+	}
+};
+
+
+// ===========================================================================
+// L E V E L =================================================================
+
+class Level
+{
+public:
+
+	int mWidth = 64;
+	int mHeight = 16;
+	Block mTiles[16][64];
+
+	Level()
+	{
+		// load map
+		json data;
+		std::ifstream ifs;
+		ifs.open("test/level.json");
+		ifs >> data;
+		ifs.close();
+
+		int y = 0;
+		for (auto& row : data)
+		{
+			int x = 0;
+			for (auto& col : row)
+			{
+				auto type = static_cast<BlockType>(col);
+				mTiles[y][x] = Block(type);
+				x++;
+			}
+			y++;
+		}
+	}
+
+	int GetMapTileYAtPoint(float y)
+	{
+		return (int)((y + TILE_SIZE / 2.0f) / TILE_SIZE);
+	}
+
+	int GetMapTileXAtPoint(float x)
+	{
+		return (int)((x + TILE_SIZE / 2.0f) / TILE_SIZE);
+	}
+
+	bool IsObstacle(int x, int y)
+	{
+		if (x < 0 or x >= mWidth or y < 0 or y >= mHeight)
+		{
+			return true;
+		}
+		return mTiles[y][x].is_obstacle;
+	}
+
+	inline bool insideCameraView(float xpos, float ypos)
+	{
+		(void) ypos;
+		if (xpos < camera.x or xpos > camera.x + camera.w - TILE_SIZE)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	void render()
+	{
+		for (int y = 0; y < mHeight; y++)
+		{
+			for (int x = 0; x < mWidth; x++)
+			{
+				float xpos = x * TILE_SIZE;
+				float ypos = y * TILE_SIZE;
+
+				if (insideCameraView(xpos, ypos))
+				{
+					mTiles[y][x].render(xpos - camera.x, ypos - camera.y);
+				}
+			}
+		}
+	}
+};
+
+// globals
+Level level;
+
+// collision
+class AABB
+{
+public:
+
+	glm::vec2 center;
+	glm::vec2 halfSize;
+
+	AABB() {}
+
+	AABB(glm::vec2 c, glm::vec2 hs)
+	{
+		center = c;
+		halfSize = hs;
+	}
+
+	bool Overlaps(AABB other)
+	{
+		if (std::abs(center.x - other.center.x) > halfSize.x + other.halfSize.x)
+		{
+			return false;
+		}
+		if (std::abs(center.y - other.center.y) > halfSize.y + other.halfSize.y)
+		{
+			return false;
+		}
+		return true;
+	}
+};
+
+
+// ===========================================================================
+// P H Y S I C S C O M P O N E N T ===========================================
+
+class PhysicsComponent
+{
+public:
+
+	// collisions
+	AABB mAABB;
+	glm::vec2 mAABBOffset;
+
+	// moving object
+	glm::vec2 mOldPosition;
+	glm::vec2 mPosition;
+
+	glm::vec2 mOldSpeed;
+	glm::vec2 mSpeed;
+
+	bool mPushedRightWall = false;
+	bool mPushesRightWall = false;
+
+	bool mPushedLeftWall = false;
+	bool mPushesLeftWall = false;
+
+	bool mWasOnGround = false;
+	bool mOnGround = false;
+
+	bool mWasAtCeiling = false;
+	bool mAtCeiling = false;
+
+	// these don't belong here..
+	int mCeilingTileX = 0;
+	int mCeilingTileY = 0;
+	int mGroundTileX = 0;
+	int mGroundTileY = 0;
+
+	PhysicsComponent()
+	{
+		mPosition = glm::vec2(0, 0);
+		mAABB.halfSize = glm::vec2(TILE_SIZE / 2, TILE_SIZE / 2);
+		mAABBOffset = mAABB.halfSize;
+	}
+
+	bool HasCeiling(glm::vec2 position, float& ceilingY)
+	{
+		glm::vec2 center = position + mAABBOffset;
+
+		// center
+		glm::vec2 checkedTile = glm::vec2(center);
+		checkedTile.y = checkedTile.y - TILE_SIZE / 2;
+
+		int tileIndexX = level.GetMapTileXAtPoint(checkedTile.x);
+		int tileIndexY = level.GetMapTileYAtPoint(checkedTile.y);
+
+		ceilingY = tileIndexY * TILE_SIZE + 24;
+
+		if (level.IsObstacle(tileIndexX, tileIndexY))
+		{
+			mCeilingTileX = tileIndexX;
+			mCeilingTileY = tileIndexY;
+			return true;
+		}
+
+		return false;
+	}
+
+	bool HasGround(glm::vec2 position, float& groundY)
+	{
+		glm::vec2 center = position + mAABBOffset;
+
+		// left
+		glm::vec2 checkedTileLeft = glm::vec2(center);
+		checkedTileLeft.x = checkedTileLeft.x + 12;
+		checkedTileLeft.y = checkedTileLeft.y + 24;
+
+		int tileIndexX1 = level.GetMapTileXAtPoint(checkedTileLeft.x);
+		int tileIndexY1 = level.GetMapTileYAtPoint(checkedTileLeft.y);
+
+		// right
+		glm::vec2 checkedTileRight = glm::vec2(center);
+		checkedTileRight.x = checkedTileRight.x - 12;
+		checkedTileRight.y = checkedTileRight.y + 24;
+
+		int tileIndexX2 = level.GetMapTileXAtPoint(checkedTileRight.x);
+		int tileIndexY2 = level.GetMapTileYAtPoint(checkedTileRight.y);
+
+		groundY = tileIndexY2 * TILE_SIZE - TILE_SIZE - 24;
+
+		if (level.IsObstacle(tileIndexX1, tileIndexY1)
+				or level.IsObstacle(tileIndexX2, tileIndexY2))
+		{
+			mGroundTileX = tileIndexX1;
+			mGroundTileY = tileIndexY1;
+			return true;
+		}
+
+		return false;
+	}
+
+	bool CollidesWithLeftWall(glm::vec2 position, float& wallX)
+	{
+		wallX = 0.0f;
+		glm::vec2 center = position + mAABBOffset;
+
+		glm::vec2 checkedTile = glm::vec2(center.x - TILE_SIZE / 2, center.y - 12);
+
+		int tileIndexX = level.GetMapTileXAtPoint(checkedTile.x);
+		int tileIndexY = level.GetMapTileYAtPoint(checkedTile.y);
+
+		wallX = tileIndexX * TILE_SIZE + TILE_SIZE / 2;
+
+		if (level.IsObstacle(tileIndexX, tileIndexY))
+		{
+			return true;
+		}
+
+		return false;
+	}
+
+	bool CollidesWithRightWall(glm::vec2 position, float& wallX)
+	{
+		wallX = 0.0f;
+		glm::vec2 center = position + mAABBOffset;
+
+		glm::vec2 checkedTile = glm::vec2(center.x + TILE_SIZE / 2, center.y - 12);
+
+		int tileIndexX = level.GetMapTileXAtPoint(checkedTile.x);
+		int tileIndexY = level.GetMapTileYAtPoint(checkedTile.y);
+
+		wallX = tileIndexX * TILE_SIZE - TILE_SIZE - 24;
+
+		if (level.IsObstacle(tileIndexX, tileIndexY))
+		{
+			return true;
+		}
+
+		return false;
+	}
+
+	// updates physics and collisions
+	void update()
+	{
+		mOldPosition = mPosition;
+		mOldSpeed = mSpeed;
+
+		mWasOnGround = mOnGround;
+		mPushedRightWall = mPushesRightWall;
+		mPushedLeftWall = mPushesLeftWall;
+		mWasAtCeiling = mAtCeiling;
+
+		mPosition = mPosition + mSpeed;
+
+		float groundY = 0.0f, ceilingY = 0.0f;
+		float rightWallX = 0.0f, leftWallX = 0.0f;
+
+		if (mSpeed.y <= 0.0f and HasCeiling(mPosition, ceilingY))
+		{
+			mPosition.y = ceilingY;
+			mSpeed.y = 0.0f;
+			mAtCeiling = true;
+		}
+		else {
+			mAtCeiling = false;
+		}
+
+		if (mSpeed.x <= 0.0f and CollidesWithLeftWall(mPosition, leftWallX))
+		{
+			mPosition.x = leftWallX;
+			mSpeed.x = 0.0f;
+			mPushesLeftWall = true;
+		}
+		else {
+			mPushesLeftWall = false;
+		}
+
+		if (mSpeed.x >= 0.0f and CollidesWithRightWall(mPosition, rightWallX))
+		{
+			mPosition.x = rightWallX;
+			mSpeed.x = 0.0f;
+			mPushesRightWall = true;
+		}
+		else {
+			mPushesRightWall = false;
+		}
+
+		if (mSpeed.y >= 0.0f and HasGround(mPosition, groundY))
+		{
+			mPosition.y = groundY;
+			mSpeed.y = 0.0f;
+			mOnGround = true;
+		}
+		else {
+			mOnGround = false;
+		}
+
+		mAABB.center = mPosition + mAABBOffset;
+	}
+};
+
+
+// ===========================================================================
+// M U S H R O O M ===========================================================
+
+class Mushroom
+{
+public:
+	static unsigned int index;
+	static std::vector<Mushroom> instances;
+
+	bool active;
+	float speed = 2.0f;
+
+	Anim anim;
+
+	PhysicsComponent physics;
+
+	Mushroom()
+	{
+		active = false;
+		physics.mPosition.x = 0;
+		physics.mPosition.y = 0;
+		anim.frames.push_back(Frame("item-mushroom-1", 0));
+	}
+
+	static void Init()
+	{
+		for (unsigned int i = 0; i < 16; i++)
+		{
+			Mushroom::instances.push_back(Mushroom());
+		}
+	}
+
+	static void Add(float x, float y)
+	{
+		Mushroom::instances[index].activate(x, y);
+		index++;
+		if (index == 16) {
+			index = 0;
+		}
+	}
+
+	static void RenderAll()
+	{
+		for (unsigned i = 0; i < Mushroom::instances.size(); i++)
+		{
+			Mushroom::instances[i].render();
+		}
+	}
+
+	void activate(float x, float y)
+	{
+		active = true;
+		physics.mPosition.x = x;
+		physics.mPosition.y = y;
+	}
+
+	inline void render()
+	{
+		if (not active)
+		{
+			return;
+		}
+
+		physics.mSpeed.x = speed;
+
+		physics.mSpeed.y += 0.80665f * 2.5f;
+		physics.mSpeed.y = std::fmin(physics.mSpeed.y, 9.80665 * 3.0f); // max falling speed
+
+		physics.update();
+
+		// left
+		if (physics.mPushesLeftWall and not physics.mPushedLeftWall)
+		{
+			speed = 2.0f;
+		}
+		// right
+		if (physics.mPushesRightWall and not physics.mPushedRightWall)
+		{
+			speed = -2.0f;
+		}
+		// floor
+		if (physics.mOnGround)
+		{
+			auto bumpa = level.mTiles[physics.mGroundTileY][physics.mGroundTileX].bumping;
+			if (bumpa)
+			{
+				std::cout << "bumpa" << std::endl;
+				physics.mSpeed.y = -9.80665 * 2.0f;
+			}
+		}
+
+		// render
+		data["item-mushroom-1"].render(
+			(physics.mPosition.x + TILE_SIZE / 2) - camera.x,
+			(physics.mPosition.y + TILE_SIZE / 2) - camera.y, 0.2f);
+	}
+};
+
+unsigned int Mushroom::index = 0;
+std::vector<Mushroom> Mushroom::instances;
+
+
+// ===========================================================================
+// P L A Y E R ===============================================================
+
+class Player
+{
+public:
+
+	PhysicsComponent physics;
+
+	// the dimensions of the player
+	static const int PLAYER_WIDTH = 48;
+	static const int PLAYER_HEIGHT = 48;
+
+	// movement
+	float mVelocity = 0.0f;
+	float mMaxSpeed = 1.5f * 3.0f;
+	float mAcceleration = 0.2f * 3.0f;
+	float mJumpSpeed = 9.80665 * 3.0f;
+
+	// [B] RUN [A] JUMP
+	bool mKeyRunDown = false;
+	bool mKeyRunPressed = false;
+	bool mKeyJumpDown = false;
+	bool mKeyJumpPressed = false;
+	bool mKeyLeftDown = false;
+	bool mKeyRightDown = false;
+
+	// initializes the variables
+	Player()
+	{
+	}
+
+	void resetEvents()
+	{
+		mKeyRunPressed = false;
+		mKeyJumpPressed = false;
+	}
+
+	// handle input
+	void handleEvent(SDL_Event& e)
+	{
+		// if a key was pressed
+		if (e.type == SDL_KEYDOWN and e.key.repeat == 0)
+		{
+			switch (e.key.keysym.sym)
+			{
+				case SDLK_z:
+					mKeyRunDown = true;
+					mKeyRunPressed = true;
+					break;
+				case SDLK_x:
+					mKeyJumpDown = true;
+					mKeyJumpPressed = true;
+					break;
+				case SDLK_LEFT:
+					mKeyLeftDown = true;
+					break;
+				case SDLK_RIGHT:
+					mKeyRightDown = true;
+					break;
+			}
+		}
+		// if a key was released
+		else if (e.type == SDL_KEYUP and e.key.repeat == 0)
+		{
+			switch (e.key.keysym.sym)
+			{
+				case SDLK_z:
+					mKeyRunDown = false;
+					break;
+				case SDLK_x:
+					mKeyJumpDown = false;
+					break;
+				case SDLK_LEFT:
+					mKeyLeftDown = false;
+					break;
+				case SDLK_RIGHT:
+					mKeyRightDown = false;
+					break;
+			}
+		}
+	}
+
+	// update the player and check collision against tiles
+	void update()
+	{
+		if (mKeyRightDown == mKeyLeftDown)
+		{
+			if (physics.mOnGround) {
+				if (mVelocity < 0.0f)
+				{
+					mVelocity += mAcceleration;
+					if (mVelocity >= 0.0f)
+					{
+						mVelocity = 0.0f;
+					}
+				}
+				else
+				{
+					mVelocity -= mAcceleration;
+					if (mVelocity <= 0.0f)
+					{
+						mVelocity = 0.0f;
+					}
+				}
+			}
+			physics.mSpeed.x = mVelocity;
+		}
+		else if (mKeyRightDown)
+		{
+			mVelocity += mAcceleration;
+			if (mVelocity > mMaxSpeed)
+			{
+				mVelocity = mMaxSpeed;
+			}
+			physics.mSpeed.x = mVelocity;
+		}
+		else if (mKeyLeftDown)
+		{
+			mVelocity -= mAcceleration;
+			if (mVelocity < -mMaxSpeed)
+			{
+				mVelocity = -mMaxSpeed;
+			}
+			physics.mSpeed.x = mVelocity;
+		}
+
+		if (physics.mOnGround and mKeyJumpPressed)
+		{
+			physics.mSpeed.y = -mJumpSpeed;
+		}
+
+		physics.mSpeed.y += 0.80665f * 2.5f;
+		physics.mSpeed.y = std::fmin(physics.mSpeed.y, 9.80665 * 3.0f); // max falling speed
+		if (not mKeyJumpDown and physics.mSpeed.y < 0.0f)
+		{
+			physics.mSpeed.y = std::fmax(physics.mSpeed.y, -2.5f * 3.0f);
+		}
+
+		physics.update();
+		UpdateCamera();
+
+		// floor
+		if (physics.mOnGround and not physics.mWasOnGround)
+		{
+			// std::cout << "floor" << std::endl;
+		}
+		// ceiling
+		if (physics.mAtCeiling and not physics.mWasAtCeiling)
+		{
+			level.mTiles[physics.mCeilingTileY][physics.mCeilingTileX].bump();
+		}
+		// left
+		if (physics.mPushesLeftWall and not physics.mPushedLeftWall)
+		{
+			// std::cout << "left" << std::endl;
+		}
+		// right
+		if (physics.mPushesRightWall and not physics.mPushedRightWall)
+		{
+			// std::cout << "right" << std::endl;
+		}
+	}
+
+	// centers the camera over the player
+	void UpdateCamera()
+	{
+		// center the camera over the player
+		camera.x = (physics.mPosition.x + TILE_SIZE / 2) - SCREEN_WIDTH / 2;
+		camera.y = TILE_SIZE / 2;
+
+		// keep the camera in bounds
+		if (camera.x < 0)
+		{
+			camera.x = 0;
+		}
+		if (camera.y < 0)
+		{
+			camera.y = 0;
+		}
+		if (camera.x > LEVEL_WIDTH - camera.w)
+		{
+			camera.x = LEVEL_WIDTH - camera.w;
+		}
+		if (camera.y > LEVEL_HEIGHT - camera.h)
+		{
+			camera.y = LEVEL_HEIGHT - camera.h;
+		}
+	}
+
+	// shows the player on the screen
+	void render()
+	{
+		// show the player
+		data["frame-1"].render(
+			(physics.mPosition.x + TILE_SIZE / 2) - camera.x,
+			(physics.mPosition.y + TILE_SIZE / 2) - camera.y, 0.2f);
+	}
+};
+
+Player player;
+
+
+// ===========================================================================
+// F U N C T I O N S =========================================================
+
+void loadData(std::string name)
+{
+	std::string filename = "test/" + name + ".json";
+
+	GLfloat SRC_WIDTH = 1920 / 2;
+	GLfloat SRC_HEIGHT = 1080 / 2;
+
+	json json_data;
+	std::ifstream ifs;
+
+	ifs.open(filename);
+	ifs >> json_data;
+	ifs.close();
+
+	unsigned int i = 0;
+	for (auto& item : json_data)
+	{
+		Color c;
+		c.r = item["r"];
+		c.g = item["g"];
+		c.b = item["b"];
+		data[name].colors.push_back(c);
+		Vertex v;
+		v.x = item["x"];
+		v.x -= SRC_WIDTH;
+		v.y = item["y"];
+		v.y -= SRC_HEIGHT;
+		data[name].vertices.push_back(v);
+		i++;
+	}
+}
+
+void init()
+{
+	Coin::Init();
+	Mushroom::Init();
+
+	Mushroom::Add(200, 100);
+	Mushroom::Add(600, 100);
+
+	camera.x = 0.0f;
+	camera.y = 0.0f;
+	camera.w = SCREEN_WIDTH;
+	camera.h = SCREEN_HEIGHT;
+
+	loadData("tile-1");
+	loadData("tile-2");
+	loadData("tile-3");
+	loadData("tile-4");
+	loadData("tile-5");
+	loadData("tile-6");
+	loadData("coin-bump-1");
+	loadData("coin-bump-2");
+	loadData("coin-bump-3");
+	loadData("coin-bump-4");
+	loadData("frame-1");
+	loadData("item-mushroom-1");
+}
+
+void update(SDL_Event e)
+{
+	player.resetEvents();
+
+	while (SDL_PollEvent(&e) != 0)
+	{
+		if (e.type == SDL_QUIT)
+		{
+			quit = true;
+		}
+		player.handleEvent(e);
+	}
+
+	player.update();
+}
+
+void render()
+{
+	glClearColor(0.42f, 0.55f, 1.0f, 1.0f);
+
+	// clear color buffer
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	// reset modelview matrix
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+
+	// enable vertex arrays
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glEnableClientState(GL_COLOR_ARRAY);
+
+	// render level
+	level.render();
+
+	// render objects
+	Mushroom::RenderAll();
+	Coin::RenderAll();
+
+	// render player
+	player.render();
+
+	// render buffer
+	glColorPointer(3, GL_FLOAT, 0, &color_buffer[0]);
+	glVertexPointer(2, GL_FLOAT, 0, &vertex_buffer[0]);
+	glDrawArrays(GL_TRIANGLES, 0, vertex_buffer.size());
+
+	// disable vertex arrays
+	glDisableClientState(GL_VERTEX_ARRAY);
+	glDisableClientState(GL_COLOR_ARRAY);
+
+	// update screen
+	SDL_GL_SwapWindow(window);
+
+	// clear buffer
+	color_buffer.clear();
+	vertex_buffer.clear();
+}
+
+void close()
+{
+	SDL_DestroyWindow(window);
+	window = NULL;
+
+	// free memory
+
+	SDL_Quit();
+}
+
+void initGL()
+{
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+
+	glOrtho(0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f);
+
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+	glEnable(GL_CULL_FACE);
+	glCullFace(GL_BACK);
+	glFrontFace(GL_CCW);
+
+	glPolygonMode(GL_FRONT, GL_FILL);
+}
+
+void initSDL()
+{
+	SDL_Init(SDL_INIT_VIDEO);
+
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+
+	window = SDL_CreateWindow("Platformed v0.1", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+
+	context = SDL_GL_CreateContext(window);
+
+	SDL_GL_SetSwapInterval(1);
+
+	SDL_CaptureMouse(SDL_TRUE);
+
+	SDL_Cursor *cur = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
+	SDL_SetCursor(cur);
+}
+
+int main(int argc, char* args[])
+{
+	(void) argc;
+	(void) args;
+
+	using clock = std::chrono::steady_clock;
+	auto next_frame = clock::now();
+
+	initSDL();
+	initGL();
+
+	init();
+
+	SDL_Event e;
+
+	while (not quit)
+	{
+		next_frame += std::chrono::milliseconds(1000 / 60); // 60Hz
+		update(e);
+		render();
+		std::this_thread::sleep_until(next_frame);
+	}
+
+	close();
+
+	return 0;
+}

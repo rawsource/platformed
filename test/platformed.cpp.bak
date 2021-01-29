@@ -1,0 +1,841 @@
+// implement fixed 60 fps update
+// change SDL_Rect to something with floats (or at least try)
+// change Vertex and Color structs to glm::vec types
+// convert and profile code after using programmable pipeline and DrawElements (shaders)
+
+#include <glm/vec2.hpp>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_opengl.h>
+
+#include <cstdlib>
+#include <cstdio>
+#include <cmath>
+
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <algorithm>
+#include <map>
+#include <vector>
+#include <string>
+
+#include "json.hpp"
+using json = nlohmann::json;
+
+
+// ===========================================================================
+// C O N S T A N T S =========================================================
+
+const int TILE_SIZE = 48;
+
+const int SCREEN_WIDTH = 1280;
+const int SCREEN_HEIGHT = 720;
+
+const int LEVEL_WIDTH = 64 * TILE_SIZE;
+const int LEVEL_HEIGHT = SCREEN_HEIGHT + TILE_SIZE;
+
+
+// ===========================================================================
+// G L O B A L S =============================================================
+
+// app
+bool quit = false;
+
+// SDL
+SDL_Window* window = NULL;
+SDL_GLContext context;
+
+SDL_Rect camera = {0, 0, SCREEN_WIDTH, SCREEN_HEIGHT};
+
+
+// ===========================================================================
+// C L A S S E S =============================================================
+
+struct Vertex
+{
+	GLfloat x;
+	GLfloat y;
+};
+
+struct Color
+{
+	GLfloat r;
+	GLfloat g;
+	GLfloat b;
+};
+
+std::vector<Color> color_buffer;
+std::vector<Vertex> vertex_buffer;
+std::vector<unsigned int> index_buffer;
+
+struct Mesh
+{
+	std::vector<Color> colors;
+	std::vector<Vertex> vertices;
+	std::vector<unsigned int> indices;
+	inline void render(float x, float y, float scale = 1.0f)
+	{
+		for (unsigned int i = 0; i < vertices.size(); i++)
+		{
+			Vertex v = vertices[i];
+			v.x *= scale;
+			v.y *= scale;
+			v.x += x;
+			v.y += y;
+			vertex_buffer.push_back(v);
+		}
+		color_buffer.insert(color_buffer.end(), colors.begin(), colors.end());
+		//index_buffer.insert(index_buffer.end(), indices.begin(), indices.end());
+		/*
+		glPushMatrix();
+		glTranslatef(x, y, 0.0f);
+		glScalef(scale, scale, scale);
+		glColorPointer(3, GL_FLOAT, 0, &colors[0]);
+		glVertexPointer(2, GL_FLOAT, 0, &vertices[0]);
+		glDrawArrays(GL_TRIANGLES, 0, vertices.size());
+		glPopMatrix();
+		*/
+	}
+};
+
+// globals
+std::map<std::string, Mesh> m;
+
+class Level
+{
+	public:
+		int mWidth = 64;
+		int mHeight = 16;
+
+		Level()
+		{
+			// load map
+			json data;
+			std::ifstream ifs;
+			ifs.open("test/level.json");
+			ifs >> data;
+			ifs.close();
+
+			int y = 0;
+			for (auto& row : data)
+			{
+				int x = 0;
+				for (auto& col : row)
+				{
+					int type = col;
+					if (type == 0)
+					{
+						mTiles[y][x] = 0;
+					}
+					else if (type == 1)
+					{
+						mTiles[y][x] = 1;
+					}
+					else if (type == 2)
+					{
+						mTiles[y][x] = 2;
+					}
+					else if (type == 3)
+					{
+						mTiles[y][x] = 3;
+					}
+					x++;
+				}
+				y++;
+			}
+		}
+
+		int GetMapTileYAtPoint(float y)
+		{
+			return (int)((y + TILE_SIZE / 2.0f) / TILE_SIZE);
+		}
+
+		int GetMapTileXAtPoint(float x)
+		{
+			return (int)((x + TILE_SIZE / 2.0f) / TILE_SIZE);
+		}
+
+		bool IsObstacle(int x, int y)
+		{
+			if (x < 0 || x >= mWidth || y < 0 || y >= mHeight)
+			{
+				return true;
+			}
+			return mTiles[y][x] != 0;
+		}
+
+		bool insideCameraView(float xpos, float ypos)
+		{
+			(void) ypos;
+			if (xpos < camera.x || xpos > camera.x + camera.w - TILE_SIZE) {
+				return false;
+			}
+			return true;
+		}
+
+		void render()
+		{
+			for (int y = 0; y < mHeight; y++)
+			{
+				for (int x = 0; x < mWidth; x++)
+				{
+					float xpos = x * TILE_SIZE;
+					float ypos = y * TILE_SIZE;
+
+					if (mTiles[y][x] == 1)
+					{
+						if (insideCameraView(xpos, ypos))
+						{
+							m["tile-1"].render(xpos - camera.x, ypos - camera.y, 0.2f);
+						}
+					}
+					if (mTiles[y][x] == 2)
+					{
+						if (insideCameraView(xpos, ypos))
+						{
+							m["tile-2"].render(xpos - camera.x, ypos - camera.y, 0.2f);
+						}
+					}
+					if (mTiles[y][x] == 3)
+					{
+						if (insideCameraView(xpos, ypos))
+						{
+							m["tile-3"].render(xpos - camera.x, ypos - camera.y, 0.2f);
+						}
+					}
+				}
+			}
+
+		}
+
+	private:
+		int mTiles[16][64];
+};
+
+// globals
+Level l;
+
+
+// collision
+class AABB
+{
+	public:
+		glm::vec2 center;
+		glm::vec2 halfSize;
+
+		AABB() {}
+
+		AABB(glm::vec2 c, glm::vec2 hs)
+		{
+			center = c;
+			halfSize = hs;
+		}
+
+		bool Overlaps(AABB other)
+		{
+			if (std::abs(center.x - other.center.x) > halfSize.x + other.halfSize.x)
+			{
+				return false;
+			}
+			if (std::abs(center.y - other.center.y) > halfSize.y + other.halfSize.y)
+			{
+				return false;
+			}
+			return true;
+		}
+};
+
+// the player that will move around on the screen
+class Player
+{
+	public:
+		// moving object
+		glm::vec2 mOldPosition;
+		glm::vec2 mPosition;
+
+		glm::vec2 mOldSpeed;
+		glm::vec2 mSpeed;
+
+		// collisions
+		AABB mAABB;
+		glm::vec2 mAABBOffset;
+
+		bool mPushedRightWall = false;
+		bool mPushesRightWall = false;
+
+		bool mPushedLeftWall = false;
+		bool mPushesLeftWall = false;
+
+		bool mWasOnGround = false;
+		bool mOnGround = false;
+
+		bool mWasAtCeiling = false;
+		bool mAtCeiling = false;
+
+		// the dimensions of the player
+		static const int PLAYER_WIDTH = 48;
+		static const int PLAYER_HEIGHT = 48;
+
+		// movement
+		float mVelocity = 0.0f;
+		float mMaxSpeed = 1.5f * 3.0f;
+		float mAcceleration = 0.2f * 3.0f;
+		float mJumpSpeed = 9.80665 * 3.0f;
+
+		// [B] RUN [A] JUMP
+		bool mKeyRunDown = false;
+		bool mKeyRunPressed = false;
+		bool mKeyJumpDown = false;
+		bool mKeyJumpPressed = false;
+		bool mKeyLeftDown = false;
+		bool mKeyRightDown = false;
+
+		Level mMap;
+
+		// initializes the variables
+		Player()
+		{
+			// initialize the collision box
+			mBox.x = 0;
+			mBox.y = 0;
+			mBox.w = PLAYER_WIDTH;
+			mBox.h = PLAYER_HEIGHT;
+
+			// new
+			mPosition = glm::vec2(0, 0);
+			mAABB.halfSize = glm::vec2(PLAYER_WIDTH / 2, PLAYER_HEIGHT / 2);
+			mAABBOffset = mAABB.halfSize;
+		}
+
+		~Player()
+		{
+		}
+
+		// updates physics and collisions
+		void UpdatePhysics()
+		{
+			mOldPosition = mPosition;
+			mOldSpeed = mSpeed;
+
+			mWasOnGround = mOnGround;
+			mPushedRightWall = mPushesRightWall;
+			mPushedLeftWall = mPushesLeftWall;
+			mWasAtCeiling = mAtCeiling;
+
+			mPosition = mPosition + mSpeed;
+
+			float groundY = 0.0f, ceilingY = 0.0f;
+			float rightWallX = 0.0f, leftWallX = 0.0f;
+
+			if (mSpeed.y <= 0.0f && HasCeiling(mPosition, ceilingY))
+			{
+				mPosition.y = ceilingY;
+				mSpeed.y = 0.0f;
+				mAtCeiling = true;
+			}
+			else {
+				mAtCeiling = false;
+			}
+
+			if (mSpeed.x <= 0.0f && CollidesWithLeftWall(mPosition, leftWallX))
+			{
+				mPosition.x = leftWallX;
+				mSpeed.x = 0.0f;
+				mPushesLeftWall = true;
+			}
+			else {
+				mPushesLeftWall = false;
+			}
+
+			if (mSpeed.x >= 0.0f && CollidesWithRightWall(mPosition, rightWallX))
+			{
+				mPosition.x = rightWallX;
+				mSpeed.x = 0.0f;
+				mPushesRightWall = true;
+			}
+			else {
+				mPushesRightWall = false;
+			}
+
+			if (mSpeed.y >= 0.0f && HasGround(mPosition, groundY))
+			{
+				mPosition.y = groundY;
+				mSpeed.y = 0.0f;
+				mOnGround = true;
+			}
+			else {
+				mOnGround = false;
+			}
+
+			mAABB.center = mPosition + mAABBOffset;
+		}
+
+		// handle input
+		void handleEvent(SDL_Event& e)
+		{
+			// if a key was pressed
+			if (e.type == SDL_KEYDOWN && e.key.repeat == 0)
+			{
+				// adjust the velocity
+				switch (e.key.keysym.sym)
+				{
+					case SDLK_z:
+						mKeyRunDown = true;
+						mKeyRunPressed = true;
+						break;
+					case SDLK_x:
+						mKeyJumpDown = true;
+						mKeyJumpPressed = true;
+						break;
+					case SDLK_LEFT:
+						mKeyLeftDown = true;
+						break;
+					case SDLK_RIGHT:
+						mKeyRightDown = true;
+						break;
+				}
+			}
+			// if a key was released
+			else if (e.type == SDL_KEYUP && e.key.repeat == 0)
+			{
+				// adjust the velocity
+				switch (e.key.keysym.sym)
+				{
+					case SDLK_z:
+						mKeyRunDown = false;
+						break;
+					case SDLK_x:
+						mKeyJumpDown = false;
+						break;
+					case SDLK_LEFT:
+						mKeyLeftDown = false;
+						break;
+					case SDLK_RIGHT:
+						mKeyRightDown = false;
+						break;
+				}
+			}
+		}
+
+		// update the player and check collision against tiles
+		void update()
+		{
+			if (mKeyRightDown == mKeyLeftDown)
+			{
+				if (mOnGround) {
+					if (mVelocity < 0.0f)
+					{
+						mVelocity += mAcceleration;
+						if (mVelocity >= 0.0f)
+						{
+							mVelocity = 0.0f;
+						}
+					}
+					else
+					{
+						mVelocity -= mAcceleration;
+						if (mVelocity <= 0.0f)
+						{
+							mVelocity = 0.0f;
+						}
+					}
+				}
+				mSpeed.x = mVelocity;
+			}
+			else if (mKeyRightDown)
+			{
+				mVelocity += mAcceleration;
+				if (mVelocity > mMaxSpeed)
+				{
+					mVelocity = mMaxSpeed;
+				}
+				mSpeed.x = mVelocity;
+			}
+			else if (mKeyLeftDown)
+			{
+				mVelocity -= mAcceleration;
+				if (mVelocity < -mMaxSpeed)
+				{
+					mVelocity = -mMaxSpeed;
+				}
+				mSpeed.x = mVelocity;
+			}
+
+			if (mOnGround && mKeyJumpPressed)
+			{
+				mSpeed.y = -mJumpSpeed;
+			}
+
+			mSpeed.y += 0.80665f * 2.5f;
+			mSpeed.y = std::fmin(mSpeed.y, 9.80665 * 3.0f); // max falling speed
+			if (! mKeyJumpDown && mSpeed.y < 0.0f)
+			{
+				mSpeed.y = std::fmax(mSpeed.y, -2.5f * 3.0f);
+			}
+
+			UpdatePhysics();
+
+			mBox.x = mPosition.x;
+			mBox.y = mPosition.y;
+
+			UpdateCamera();
+
+			// floor
+			if (mOnGround && ! mWasOnGround)
+			{
+				// std::cout << "floor" << std::endl;
+			}
+			// ceiling
+			if (mAtCeiling && ! mWasAtCeiling)
+			{
+				// std::cout << "ceiling" << std::endl;
+			}
+			// left
+			if (mPushesLeftWall && ! mPushedLeftWall)
+			{
+				// std::cout << "left" << std::endl;
+			}
+			// right
+			if (mPushesRightWall && ! mPushedRightWall)
+			{
+				// std::cout << "right" << std::endl;
+			}
+		}
+
+		// centers the camera over the player
+		void UpdateCamera()
+		{
+			// center the camera over the player
+			camera.x = (mBox.x + PLAYER_WIDTH / 2) - SCREEN_WIDTH / 2;
+			camera.y = 24; // (mBox.y + PLAYER_HEIGHT / 2) - SCREEN_HEIGHT / 2;
+
+			// keep the camera in bounds
+			if (camera.x < 0)
+			{
+				camera.x = 0;
+			}
+			if (camera.y < 0)
+			{
+				camera.y = 0;
+			}
+			if (camera.x > LEVEL_WIDTH - camera.w)
+			{
+				camera.x = LEVEL_WIDTH - camera.w;
+			}
+			if (camera.y > LEVEL_HEIGHT - camera.h)
+			{
+				camera.y = LEVEL_HEIGHT - camera.h;
+			}
+		}
+
+		// shows the player on the screen
+		void render()
+		{
+			// show the player
+			m["frame-1"].render((mBox.x + TILE_SIZE / 2) - camera.x, (mBox.y + TILE_SIZE / 2) - camera.y, 0.2f);
+		}
+
+		bool HasCeiling(glm::vec2 position, float& ceilingY)
+		{
+			glm::vec2 center = position + mAABBOffset;
+
+			// center
+			glm::vec2 checkedTile = glm::vec2(center);
+			checkedTile.y = checkedTile.y - TILE_SIZE / 2;
+
+			int tileIndexX = mMap.GetMapTileXAtPoint(checkedTile.x);
+			int tileIndexY = mMap.GetMapTileYAtPoint(checkedTile.y);
+
+			ceilingY = tileIndexY * TILE_SIZE + 24;
+
+			if (mMap.IsObstacle(tileIndexX, tileIndexY))
+			{
+				return true;
+			}
+
+			return false;
+		}
+
+		bool HasGround(glm::vec2 position, float& groundY)
+		{
+			glm::vec2 center = position + mAABBOffset;
+
+			// left
+			glm::vec2 checkedTileLeft = glm::vec2(center);
+			checkedTileLeft.x = checkedTileLeft.x + 12;
+			checkedTileLeft.y = checkedTileLeft.y + 24;
+
+			int tileIndexX1 = mMap.GetMapTileXAtPoint(checkedTileLeft.x);
+			int tileIndexY1 = mMap.GetMapTileYAtPoint(checkedTileLeft.y);
+
+			// right
+			glm::vec2 checkedTileRight = glm::vec2(center);
+			checkedTileRight.x = checkedTileRight.x - 12;
+			checkedTileRight.y = checkedTileRight.y + 24;
+
+			int tileIndexX2 = mMap.GetMapTileXAtPoint(checkedTileRight.x);
+			int tileIndexY2 = mMap.GetMapTileYAtPoint(checkedTileRight.y);
+
+			groundY = tileIndexY2 * TILE_SIZE - TILE_SIZE - 24;
+
+			if (mMap.IsObstacle(tileIndexX1, tileIndexY1)
+					|| mMap.IsObstacle(tileIndexX2, tileIndexY2))
+			{
+				return true;
+			}
+
+			return false;
+		}
+
+		bool CollidesWithLeftWall(glm::vec2 position, float& wallX)
+		{
+			wallX = 0.0f;
+			glm::vec2 center = position + mAABBOffset;
+
+			glm::vec2 checkedTile = glm::vec2(center.x - TILE_SIZE / 2, center.y - 12);
+
+			int tileIndexX = mMap.GetMapTileXAtPoint(checkedTile.x);
+			int tileIndexY = mMap.GetMapTileYAtPoint(checkedTile.y);
+
+			wallX = tileIndexX * TILE_SIZE + TILE_SIZE / 2;
+
+			if (mMap.IsObstacle(tileIndexX, tileIndexY))
+			{
+				return true;
+			}
+
+			return false;
+		}
+
+		bool CollidesWithRightWall(glm::vec2 position, float& wallX)
+		{
+			wallX = 0.0f;
+			glm::vec2 center = position + mAABBOffset;
+
+			glm::vec2 checkedTile = glm::vec2(center.x + TILE_SIZE / 2, center.y - 12);
+
+			int tileIndexX = mMap.GetMapTileXAtPoint(checkedTile.x);
+			int tileIndexY = mMap.GetMapTileYAtPoint(checkedTile.y);
+
+			wallX = tileIndexX * TILE_SIZE - TILE_SIZE - 24;
+
+			if (mMap.IsObstacle(tileIndexX, tileIndexY))
+			{
+				return true;
+			}
+
+			return false;
+		}
+	private:
+		// collision box of the player
+		SDL_Rect mBox;
+};
+
+Player player;
+
+
+// ===========================================================================
+// F U N C T I O N S =========================================================
+
+void loadData(std::string name)
+{
+	std::string filename = "test/" + name + ".json";
+
+	GLfloat SRC_WIDTH = 1920 / 2;
+	GLfloat SRC_HEIGHT = 1080 / 2;
+
+	json data;
+	std::ifstream ifs;
+
+	ifs.open(filename);
+	ifs >> data;
+	ifs.close();
+
+	unsigned int i = 0;
+	for (auto& item : data)
+	{
+		Color c;
+		c.r = item["r"];
+		c.g = item["g"];
+		c.b = item["b"];
+		m[name].colors.push_back(c);
+		Vertex v;
+		v.x = item["x"];
+		v.x -= SRC_WIDTH;
+		v.y = item["y"];
+		v.y -= SRC_HEIGHT;
+		m[name].vertices.push_back(v);
+		i++;
+	}
+
+	// index elements
+	std::vector<Color> out_colors;
+	std::vector<Vertex> out_vertices;
+	std::vector<unsigned int> out_indices;
+
+	for (unsigned int i = 0; i < m[name].vertices.size(); i++)
+	{
+		unsigned int index;
+		bool exists = false;
+		for (unsigned int j = 0; j < out_vertices.size(); j++)
+		{
+			if (out_vertices[j].x == m[name].vertices[i].x &&
+				out_vertices[j].y == m[name].vertices[i].y)
+			{
+				index = j;
+				exists = true;
+			}
+		}
+		if (exists)
+		{
+			// similar vertex exists, use it instead
+			out_indices.push_back(index);
+		}
+		else {
+			// add to out
+			out_colors.push_back(m[name].colors[i]);
+			out_vertices.push_back(m[name].vertices[i]);
+			out_indices.push_back(out_vertices.size() - 1);
+		}
+	}
+	//m[name].colors = out_colors;
+	//m[name].indices = out_indices;
+	//m[name].vertices = out_vertices;
+}
+
+void update()
+{
+}
+
+void render()
+{
+	glClearColor(0.42f, 0.55f, 1.0f, 1.0f);
+
+	// clear color buffer
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	// reset modelview matrix
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+
+	// set polygon mode
+	glPolygonMode(GL_FRONT, GL_FILL);
+
+	// enable vertex arrays
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glEnableClientState(GL_COLOR_ARRAY);
+
+	l.render();
+	player.render();
+
+	// render buffer
+	glColorPointer(3, GL_FLOAT, 0, &color_buffer[0]);
+	glVertexPointer(2, GL_FLOAT, 0, &vertex_buffer[0]);
+	glDrawArrays(GL_TRIANGLES, 0, vertex_buffer.size());
+	//glDrawElements(GL_TRIANGLES, index_buffer.size(), GL_UNSIGNED_INT, 0);
+
+	// disable vertex arrays
+	glDisableClientState(GL_VERTEX_ARRAY);
+	glDisableClientState(GL_COLOR_ARRAY);
+
+	// update screen
+	SDL_GL_SwapWindow(window);
+
+	// clear buffer
+	color_buffer.clear();
+	//index_buffer.clear();
+	vertex_buffer.clear();
+}
+
+void close()
+{
+	SDL_DestroyWindow(window);
+	window = NULL;
+
+	// free memory
+
+	SDL_Quit();
+}
+
+void initGL()
+{
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+
+	glOrtho(0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f);
+
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+	glEnable(GL_CULL_FACE);
+	glCullFace(GL_BACK);
+	glFrontFace(GL_CCW);
+}
+
+void initSDL()
+{
+	SDL_Init(SDL_INIT_VIDEO);
+
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+
+	window = SDL_CreateWindow("Platformed v0.1", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+
+	context = SDL_GL_CreateContext(window);
+
+	SDL_GL_SetSwapInterval(1);
+
+	SDL_CaptureMouse(SDL_TRUE);
+
+	SDL_Cursor *cur = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR);
+	SDL_SetCursor(cur);
+}
+
+int main(int argc, char* args[])
+{
+	(void) argc;
+	(void) args;
+
+	initSDL();
+	initGL();
+
+	loadData("tile-1");
+	loadData("tile-2");
+	loadData("tile-3");
+	loadData("frame-1");
+
+	SDL_Event e;
+
+	while (! quit)
+	{
+
+		player.mKeyRunPressed = false;
+		player.mKeyJumpPressed = false;
+
+		while (SDL_PollEvent(&e) != 0)
+		{
+			// sdl events
+			if (e.type == SDL_QUIT)
+			{
+				quit = true;
+			}
+			// handle input for the player
+			player.handleEvent(e);
+		}
+
+		// update player
+		player.update();
+
+		update();
+		render();
+
+	}
+
+	close();
+
+	return 0;
+}
+
